@@ -3,10 +3,11 @@ FROM python:3.10
 WORKDIR /app
 
 # Copy code & requirements
-COPY fire_segmentation_model.h5 /app/fire_segmentation_model.h5
+COPY distilled_student_model_weights.weights.h5 /app/distilled_student_model_weights.weights.h5
 COPY server.py /app/server.py
 COPY requirements.txt /app/requirements.txt
 COPY start.sh /app/start.sh
+COPY static /app/static
 
 # Cài các thư viện hệ thống cần thiết
 RUN apt-get update && apt-get install -y \
