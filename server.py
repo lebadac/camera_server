@@ -13,6 +13,9 @@ try:
 except Exception as e:
     raise RuntimeError(f"Lỗi khi load model: {str(e)}")
 
+@app.get('/')
+def read_root():
+    return {"message": "Deep Learning model deployed"}
 
 @app.post("/predict/")
 async def predict_fire(file: UploadFile = File(...)):
