@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import asyncio
 
-from model.segment import segment_image
+from model.segment import segment_image, load_model
 
 app = FastAPI()
 
@@ -16,6 +16,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# 🔥 Load model khi server khởi động
+@app.on_event("startup")
+def startup_event():
+    load_model()
 
 detection_enabled = True
 latest_frame = None  # Buffer lưu ảnh mới nhất
@@ -33,13 +37,9 @@ async def upload_frame(file: UploadFile = File(...)):
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-    # Resize ảnh input xuống 288x288 để segment
-    resized = cv2.resize(img, (288, 288))
-
     if detection_enabled:
-        segmented_resized = segment_image(resized)  # segment ảnh resized
-        # Resize mask kết quả về lại kích thước gốc
-        result = cv2.resize(segmented_resized, (img.shape[1], img.shape[0]))
+        result = segment_image(img)  # segment ảnh resized
+
     else:
         result = img
 
