@@ -9,20 +9,20 @@ from model.segment import segment_image, load_model
 
 app = FastAPI()
 
-# Cho phép truy cập từ Android app
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # 🔥 Load model khi server khởi động
 @app.on_event("startup")
 def startup_event():
     load_model()
 
 detection_enabled = True
-latest_frame = None  # Buffer lưu ảnh mới nhất
+latest_frame = None
 
 @app.post("/toggle_detection")
 def toggle_detection(enable: bool):
@@ -38,8 +38,7 @@ async def upload_frame(file: UploadFile = File(...)):
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if detection_enabled:
-        result = segment_image(img)  # segment ảnh resized
-
+        result = segment_image(img)
     else:
         result = img
 
@@ -54,7 +53,7 @@ async def generate_video():
         if latest_frame:
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n\r\n" + latest_frame + b"\r\n")
-        await asyncio.sleep(0.05)  # sleep 50ms tránh chiếm CPU quá mức
+        await asyncio.sleep(0.05)
 
 @app.get("/video_feed")
 def video_feed():
