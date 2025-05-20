@@ -24,6 +24,11 @@ def startup_event():
 detection_enabled = True
 latest_frame = None
 
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to Fire Predictor API"}
+
+
 @app.post("/toggle_detection")
 def toggle_detection(enable: bool):
     global detection_enabled
