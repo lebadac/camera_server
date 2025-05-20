@@ -135,7 +135,7 @@ def build_student_model(input_shape, kan_dim=64, num_kan_layers=1):
     return model
 
     input_shape = (288, 288, 3)
-    model = build_student_model(input_shape, kan_dim=16, num_kan_layers=2)
+    model = build_student_model(input_shape, kan_dim=256, num_kan_layers=2)
     try:
         model.load_weights('distilled_student_model_weights.weights.h5')
         print("Weights loaded successfully")
@@ -147,7 +147,7 @@ def build_student_model(input_shape, kan_dim=64, num_kan_layers=1):
     input_tensor = np.expand_dims(norm, axis=0)
 
     prediction = model.predict(input_tensor)[0]
-    mask = (prediction > 0.5).astype(np.uint8) * 255
+    mask = (prediction > 0.6).astype(np.uint8) * 255
     mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
     result = image.copy()
     result[mask > 0] = [0, 0, 255]
@@ -160,7 +160,7 @@ model = None  # Khai báo biến model global
 def load_model():
     global model
     input_shape = (288, 288, 3)
-    model = build_student_model(input_shape, kan_dim=16, num_kan_layers=2)
+    model = build_student_model(input_shape, kan_dim=256, num_kan_layers=2)
     try:
         model.load_weights('distilled_student_model_weights.weights.h5')
         print("Model loaded successfully")
@@ -168,14 +168,14 @@ def load_model():
         print(f"Failed to load weights: {e}")
 
 
-def segment_image(image, min_fire_ratio=0.005):
+def segment_image(image, min_fire_ratio=0.003):
     global model
     resized = cv2.resize(image, (288, 288))
     norm = resized.astype(np.float32) / 255.0
     input_tensor = np.expand_dims(norm, axis=0)
 
     prediction = model.predict(input_tensor, verbose=0)[0]
-    mask = (prediction > 0.5).astype(np.uint8)
+    mask = (prediction > 0.6).astype(np.uint8)
 
     # Tính tỉ lệ pixel được segment (vùng cháy)
     fire_ratio = np.sum(mask) / mask.size

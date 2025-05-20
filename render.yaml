@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: fire-predictor
+    env: docker
+    plan: free
+    repo: https://github.com/lebadac/camera_server
+    branch: main
+    dockerfilePath: ./Dockerfile
+    buildFilter:
+      paths:
+        - server/**
+    envVars:
+      - key: PORT
+        value: 8888
