@@ -3,8 +3,13 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
 
+import tensorflow as tf
+from tensorflow.keras import layers, models
 
 class KANLayer(layers.Layer):
+    """
+    Custom KAN layer implementing learnable activation functions.
+    """
     def __init__(self, input_dim, output_dim, activation='gelu'):
         super(KANLayer, self).__init__()
         self.weight = self.add_weight(
@@ -25,108 +30,84 @@ class KANLayer(layers.Layer):
         x = tf.tensordot(inputs, self.weight, axes=1) + self.bias
         return self.activation(x)
 
-
-class FastAttentionLayer(layers.Layer):
-    def __init__(self, output_dim):
-        super(FastAttentionLayer, self).__init__()
-        self.output_dim = output_dim
-        self.query_proj = layers.Dense(output_dim)
-        self.key_proj = layers.Dense(output_dim)
-        self.value_proj = layers.Dense(output_dim)
-
-    def call(self, inputs):
-        input_rank = inputs.shape.rank
-        if input_rank == 4:
-            b, h, w, c = tf.shape(inputs)[0], tf.shape(inputs)[1], tf.shape(inputs)[2], tf.shape(inputs)[3]
-            n = h * w
-            x = tf.reshape(inputs, [b, n, c])
-            Q = self.query_proj(tf.nn.l2_normalize(x, axis=-1))
-            K = self.key_proj(tf.nn.l2_normalize(x, axis=-1))
-            V = self.value_proj(x)
-            KV = tf.matmul(K, V, transpose_a=True)
-            Y = tf.matmul(Q, KV) / tf.cast(n, tf.float32)
-            return tf.reshape(Y + x, [b, h, w, self.output_dim])
-        elif input_rank == 3:
-            n = tf.shape(inputs)[1]
-            Q = self.query_proj(tf.nn.l2_normalize(inputs, axis=-1))
-            K = self.key_proj(tf.nn.l2_normalize(inputs, axis=-1))
-            V = self.value_proj(inputs)
-            KV = tf.matmul(K, V, transpose_a=True)
-            Y = tf.matmul(Q, KV) / tf.cast(n, tf.float32)
-            return Y + inputs
-        else:
-            raise ValueError("Unsupported input rank.")
-
-
-def tokenized_kan_block_student(inputs, token_dim, kan_layers=2):
+def tokenized_kan_block(inputs, token_dim, kan_layers=2):
+    """
+    Implements the Tok-KAN block with ConvLSTM2D for temporal processing.
+    """
     tokens = layers.Reshape((-1, inputs.shape[-1]))(inputs)
     tokens = layers.Dense(token_dim, activation='relu')(tokens)
 
-    x = tokens
-    for _ in range(kan_layers):
-        y = KANLayer(token_dim, token_dim)(x)
-        y = layers.LayerNormalization()(y)
-        x = layers.Add()([x, y])
+    processed_tokens = KANLayer(token_dim, token_dim)(tokens)
+    processed_tokens = layers.LayerNormalization()(processed_tokens)
 
-    x = FastAttentionLayer(token_dim)(x)
-    x = layers.LayerNormalization()(x)
+    projected_inputs = layers.Conv2D(token_dim, (1, 1), activation='relu', padding='same')(inputs)
+    lstm_input = layers.Reshape((1, inputs.shape[1], inputs.shape[2], token_dim))(projected_inputs)
 
-    projected = layers.Conv2D(token_dim, (1, 1), padding='same', activation='relu')(inputs)
-    x_reshaped = layers.Lambda(lambda x: tf.reshape(x, (-1, projected.shape[1], projected.shape[2], token_dim)))(x)
-    tokens = layers.Add()([x_reshaped, projected])
+    lstm_output = layers.ConvLSTM2D(256, (3, 3), activation='relu', padding='same', return_sequences=False)(lstm_input)
+    lstm_output = layers.Reshape((-1, token_dim))(lstm_output)
 
-    out = KANLayer(token_dim, token_dim)(tokens)
-    out = layers.LayerNormalization()(out)
+    tokens = layers.Add()([processed_tokens, lstm_output])
+    processed_tokens = KANLayer(token_dim, token_dim)(tokens)
+    processed_tokens = layers.LayerNormalization()(processed_tokens)
 
-    return layers.Reshape((inputs.shape[1], inputs.shape[2], token_dim))(out)
+    reshaped_output = layers.Reshape((inputs.shape[1], inputs.shape[2], token_dim))(processed_tokens)
+    return reshaped_output
 
+def unet_kan_lstm_mobilenetv2(input_shape=(240, 240, 3), kan_dim=256, num_kan_layers=2):
+    """
+    Builds the U-Net-KAN-LSTM-MobileNetV2 model with MobileNetV2 encoder and KAN-LSTM bottleneck.
 
-def fuse_up(skip, up_input, out_channels):
-    upsampled = layers.UpSampling2D((2, 2), interpolation='bilinear')(up_input)
-    height, width = upsampled.shape[1], upsampled.shape[2]
-    skip_resized = layers.Resizing(height, width, interpolation='bilinear')(skip)
+    Args:
+        input_shape (tuple): Shape of the input image (height, width, channels).
+        kan_dim (int): Dimension of the tokenized KAN block.
+        num_kan_layers (int): Number of KAN layers in the block.
 
-    if skip_resized.shape[-1] != upsampled.shape[-1]:
-        skip_resized = layers.Conv2D(upsampled.shape[-1], (1, 1), padding='same', use_bias=False)(skip_resized)
-
-    x = layers.Add()([upsampled, skip_resized])
-    x = layers.ReLU()(x)
-    x = layers.Conv2D(out_channels, (3, 3), padding='same', use_bias=False)(x)
-    return x
-
-
-def build_student_model(input_shape, kan_dim=64, num_kan_layers=1):
+    Returns:
+        Model: U-Net-KAN-LSTM-MobileNetV2 model.
+    """
     inputs = layers.Input(shape=input_shape)
+
     base_model = tf.keras.applications.MobileNetV2(
         input_shape=input_shape,
         include_top=False,
         weights="imagenet"
     )
-
-    for layer in base_model.layers:
-        layer.trainable = 'block_13' in layer.name
+    base_model.trainable = False
 
     c1 = base_model.get_layer('block_1_expand_relu').output
     c2 = base_model.get_layer('block_3_expand_relu').output
     c3 = base_model.get_layer('block_6_expand_relu').output
     c4 = base_model.get_layer('block_13_expand_relu').output
 
-    bottleneck = tokenized_kan_block_student(c4, kan_dim, num_kan_layers)
+    bottleneck = tokenized_kan_block(c4, kan_dim, num_kan_layers)
 
-    c4_skip = layers.Conv2D(64, (1, 1), padding='same', use_bias=False)(c4)
-    c4_skip = FastAttentionLayer(64)(c4_skip)
-    u1 = fuse_up(c4_skip, bottleneck, 32)
+    u1 = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(bottleneck)
+    u1 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(u1)
+    c4_resized = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(c4)
+    c4_resized = layers.Conv2D(576, (3, 3), activation='relu', padding='same')(c4_resized)
+    u1 = layers.concatenate([u1, c4_resized])
+    u1 = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(u1)
 
-    c3_skip = layers.Conv2D(64, (1, 1), padding='same', use_bias=False)(c3)
-    c3_skip = FastAttentionLayer(64)(c3_skip)
-    u2 = fuse_up(c3_skip, u1, 16)
+    u2 = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(u1)
+    u2 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(u2)
+    c3_resized = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(c3)
+    c3_resized = layers.Conv2D(192, (3, 3), activation='relu', padding='same')(c3_resized)
+    u2 = layers.concatenate([u2, c3_resized])
+    u2 = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(u2)
 
-    c2_skip = layers.Conv2D(32, (1, 1), padding='same', use_bias=False)(c2)
-    c2_skip = FastAttentionLayer(32)(c2_skip)
-    u3 = fuse_up(c2_skip, u2, 8)
+    u3 = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(u2)
+    u3 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(u3)
+    c2_resized = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(c2)
+    c2_resized = layers.Conv2D(96, (3, 3), activation='relu', padding='same')(c2_resized)
+    u3 = layers.concatenate([u3, c2_resized])
+    u3 = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(u3)
 
-    c1_skip = layers.Conv2D(16, (1, 1), padding='same', use_bias=False)(c1)
-    u4 = fuse_up(c1_skip, u3, 8)
+    u4 = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(u3)
+    u4 = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(u4)
+    c1_resized = layers.UpSampling2D(size=(2, 2), interpolation='bilinear')(c1)
+    c1_resized = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(c1_resized)
+    u4 = layers.concatenate([u4, c1_resized])
+    u4 = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(u4)
 
     u4 = layers.Dropout(0.05)(u4)
     outputs = layers.Conv2D(1, (1, 1), activation='sigmoid')(u4)
@@ -134,35 +115,14 @@ def build_student_model(input_shape, kan_dim=64, num_kan_layers=1):
     model = models.Model(inputs=base_model.input, outputs=outputs)
     return model
 
-    input_shape = (288, 288, 3)
-    model = build_student_model(input_shape, kan_dim=256, num_kan_layers=2)
-    try:
-        model.load_weights('distilled_student_model_weights.weights.h5')
-        print("Weights loaded successfully")
-    except ValueError as e:
-        print(f"Error loading weights: {e}")
-
-    resized = cv2.resize(image, (288, 288))
-    norm = resized.astype(np.float32) / 255.0
-    input_tensor = np.expand_dims(norm, axis=0)
-
-    prediction = model.predict(input_tensor)[0]
-    mask = (prediction > 0.6).astype(np.uint8) * 255
-    mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
-    result = image.copy()
-    result[mask > 0] = [0, 0, 255]
-    return result
-
-# Giữ nguyên định nghĩa lớp và hàm build_student_model...
-
 model = None  # Khai báo biến model global
 
 def load_model():
     global model
     input_shape = (288, 288, 3)
-    model = build_student_model(input_shape, kan_dim=256, num_kan_layers=2)
+    model = unet_kan_lstm_mobilenetv2(input_shape)
     try:
-        model.load_weights('distilled_student_model_weights.weights.h5')
+        model.load_weights('u_kan_lstm_mobilenetv2.weights.h5')
         print("Model loaded successfully")
     except Exception as e:
         print(f"Failed to load weights: {e}")
@@ -170,6 +130,12 @@ def load_model():
 
 def segment_image(image, min_fire_ratio=0.003):
     global model
+    
+    # Thêm kiểm tra an toàn, phòng trường hợp model load thất bại
+    if model is None:
+        print("LỖI: Model chưa được load, trả về ảnh gốc.")
+        return image, False # Trả về 2 giá trị
+
     resized = cv2.resize(image, (288, 288))
     norm = resized.astype(np.float32) / 255.0
     input_tensor = np.expand_dims(norm, axis=0)
@@ -180,14 +146,21 @@ def segment_image(image, min_fire_ratio=0.003):
     # Tính tỉ lệ pixel được segment (vùng cháy)
     fire_ratio = np.sum(mask) / mask.size
 
-    if fire_ratio < min_fire_ratio:
-        # Không đánh dấu gì nếu vùng cháy nhỏ
-        return image
+    # --- SỬA LỖI LOGIC TẠI ĐÂY ---
+    
+    # 1. Quyết định cờ true/false ngay tại đây
+    is_fire_detected = (fire_ratio >= min_fire_ratio)
 
-    # Nếu đủ lớn thì tạo mask
+    if not is_fire_detected:
+        # 2. Nếu không có lửa: Trả về ảnh GỐC và cờ False
+        return image, False
+
+    # 3. Nếu CÓ lửa: Tạo mask màu đỏ
     mask = (mask * 255).astype(np.uint8)
     mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
 
     result = image.copy()
-    result[mask > 0] = [0, 0, 255]
-    return result
+    result[mask > 0] = [0, 0, 255] # BGR = Đỏ
+    
+    # 4. Trả về ảnh ĐÃ XỬ LÝ và cờ True
+    return result, True
