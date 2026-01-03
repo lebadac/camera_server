@@ -31,6 +31,16 @@ async def init_db():
         except Exception:
             pass
 
+        # Create device_tokens table
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_tokens (
+                token TEXT PRIMARY KEY,
+                created_at TIMESTAMPTZ DEFAULT now()
+            );
+            """
+        )
+
 async def close_db():
     """
     Closes the database connection pool gracefully.
@@ -87,3 +97,41 @@ async def list_events(camera_id: int) -> List[Dict[str, Any]]:
             camera_id,
         )
         return [dict(r) for r in rows]
+
+async def register_device_token(token: str):
+    """
+    Registers a new device token for push notifications.
+    """
+    if _db_pool is None:
+        raise RuntimeError("Database pool not initialized")
+    
+    async with _db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO device_tokens(token) VALUES ($1) ON CONFLICT (token) DO NOTHING",
+            token
+        )
+
+async def get_all_device_tokens() -> List[str]:
+    """
+    Retrieves all registered device tokens.
+    """
+    if _db_pool is None:
+        raise RuntimeError("Database pool not initialized")
+    
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT token FROM device_tokens")
+        return [r["token"] for r in rows]
+
+async def get_camera_label(camera_id: int) -> str:
+    """
+    Retrieves the camera label (name) by camera_id.
+    Returns the label or a default string if not found.
+    """
+    if _db_pool is None:
+        raise RuntimeError("Database pool not initialized")
+    
+    async with _db_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT label FROM cameras WHERE camera_id = $1", camera_id)
+        if row:
+            return row["label"]
+        return f"Camera {camera_id}"

@@ -72,6 +72,16 @@ Edit `camera_config.json` to optimize for your network:
 - **Recent Events**: `http://localhost:8000/events/{camera_id}`
 - **Detection Toggle**: `http://localhost:8000/toggle_detection/{camera_id}` (Call this to turn ON/OFF AI)
 - **Camera Status**: `http://localhost:8000/status/{camera_id}`
+- **FCM Registration**: `POST /register_token` (Android app sends its FCM token here)
+
+---
+
+## 📦 Large File Management (Git LFS)
+The AI weights file (`u_kan_lstm_mobilenetv2.weights.h5`) exceeds 100MB. If you cannot push to GitHub, follow these steps:
+1. Install [Git LFS](https://git-lfs.github.com/).
+2. Run: `git lfs install`
+3. Run: `git lfs track "*.weights.h5"`
+4. Add `.gitattributes`, then commit and push again.
 
 ---
 

@@ -10,10 +10,14 @@ from fastapi import FastAPI, UploadFile, File, Query, WebSocket, WebSocketDiscon
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 
-from config import RECORDER_TEMP_DIR
+from config import RECORDER_TEMP_DIR, S3_BUCKET_NAME
 from model.segment import segment_image, load_model
-from utils.database import init_db, close_db, insert_event, list_events
 from utils.s3_client import upload_file_to_s3
+from utils.database import (
+    init_db, close_db, insert_event, list_events, 
+    register_device_token, get_all_device_tokens
+)
+from utils.notifier import init_firebase, send_fire_notification
 from services.video_recorder import video_recorder_worker, frame_queue
 
 # Global state for camera streams
@@ -28,7 +32,7 @@ def get_camera_state(camera_id: int) -> Dict[str, Any]:
             "event": asyncio.Event(),
             "lock": asyncio.Lock(),
             "is_processing": False,
-            "detection_enabled": False  # Default to ON
+            "detection_enabled": True  # Default to ON
         }
     return camera_states[camera_id]
 
@@ -45,6 +49,7 @@ async def lifespan(app: FastAPI):
     print(f"🎬 Video recording synchronized at {RECORD_FPS} FPS")
     await asyncio.to_thread(load_model)
     await init_db()
+    await asyncio.to_thread(init_firebase) # Initialize Firebase
     recorder_task = asyncio.create_task(video_recorder_worker())
     
     yield
@@ -125,13 +130,23 @@ async def process_frame(img: np.ndarray, camera_id: int, background_tasks: Optio
         state["event"].set()
         state["event"].clear()
 
-    # 3. Handle fire alerts in the background if detected
+     # 3. Handle fire alerts in the background if detected
     if is_fire:
+        # Generate timestamp for consistent naming
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         if background_tasks:
             background_tasks.add_task(upload_alert_task, result_img, camera_id)
         else:
-            # Fallback for environments where background_tasks is not available (like raw WS loop)
             asyncio.create_task(upload_alert_task(result_img, camera_id))
+        
+        # Trigger Push Notifications
+        async def notify_all():
+            tokens = await get_all_device_tokens()
+            if tokens:
+                await send_fire_notification(tokens, camera_id)
+        
+        asyncio.create_task(notify_all())
     
     return is_fire
 
@@ -225,6 +240,20 @@ async def get_events(camera_id: int):
         if isinstance(r.get("created_at"), datetime):
             r["created_at"] = r["created_at"].isoformat()
     return {"camera_id": camera_id, "events": rows}
+
+@app.post("/register_token")
+async def register_token(data: Dict[str, str]):
+    """
+    Registers an Android device token for Firebase Push Notifications.
+    Example body: {"token": "YOUR_DEVICE_REGISTRATION_TOKEN"}
+    """
+    token = data.get("token")
+    if not token:
+        return {"error": "Token is required"}, 400
+    
+    await register_device_token(token)
+    print(f"📱 New device token registered: {token[:20]}...")
+    return {"status": "success", "message": "Token registered"}
 
 @app.get("/video_feed/{camera_id}")
 async def video_feed(camera_id: int):

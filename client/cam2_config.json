@@ -1,6 +1,6 @@
 {
     "camera_id": 26,
-    "api_url": "http://0.0.0.0:8000",
+    "api_url": "https://forceless-josette-unluckier.ngrok-free.dev",
     "video_source": 0,
     "capture_fps": 30,
     "detection_fps": 10,
