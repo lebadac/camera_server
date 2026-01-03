@@ -1,0 +1,254 @@
+import asyncio
+import os
+import cv2
+import numpy as np
+from datetime import datetime
+from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, UploadFile, File, Query, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi.responses import StreamingResponse
+from starlette.middleware.cors import CORSMiddleware
+
+from config import RECORDER_TEMP_DIR
+from model.segment import segment_image, load_model
+from utils.database import init_db, close_db, insert_event, list_events
+from utils.s3_client import upload_file_to_s3
+from services.video_recorder import video_recorder_worker, frame_queue
+
+# Global state for camera streams
+detection_enabled = True
+camera_states: Dict[int, Dict[str, Any]] = {}
+
+def get_camera_state(camera_id: int) -> Dict[str, Any]:
+    """Helper to get or create state for a specific camera."""
+    if camera_id not in camera_states:
+        camera_states[camera_id] = {
+            "latest_frame": None,
+            "event": asyncio.Event(),
+            "lock": asyncio.Lock(),
+            "is_processing": False,
+            "detection_enabled": False  # Default to ON
+        }
+    return camera_states[camera_id]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manages the application lifecycle.
+    - Startup: Loads the segmentation model, initializes the database, and starts the video recorder worker.
+    - Shutdown: Cancels the recorder worker and closes the database connection.
+    """
+    # Startup
+    os.makedirs(RECORDER_TEMP_DIR, exist_ok=True)
+    from config import RECORD_FPS
+    print(f"🎬 Video recording synchronized at {RECORD_FPS} FPS")
+    await asyncio.to_thread(load_model)
+    await init_db()
+    recorder_task = asyncio.create_task(video_recorder_worker())
+    
+    yield
+    
+    # Shutdown
+    recorder_task.cancel()
+    await close_db()
+
+app = FastAPI(title="Fire Detection Camera Server", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.post("/upload_frame")
+async def upload_frame(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    camera_id: int = Query(...)
+):
+    """
+    Receives an image frame via HTTP POST, performs detection, and records in background.
+    """
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return {"error": "Invalid image"}
+
+    is_fire = await process_frame(img, camera_id, background_tasks)
+    return {"fire_detected": is_fire}
+
+async def upload_alert_task(img: np.ndarray, camera_id: int):
+    """Background task to handle S3 upload and DB logging for fire alerts."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    object_name = f"frame/camera_{camera_id}/fire-{timestamp}.jpg"
+    tmp_path = os.path.join(RECORDER_TEMP_DIR, f"alert_{camera_id}_{timestamp}.jpg")
+    
+    try:
+        # Save locally first
+        await asyncio.to_thread(cv2.imwrite, tmp_path, img)
+        # Upload to S3
+        ok = await asyncio.to_thread(upload_file_to_s3, tmp_path, object_name, "image/jpeg", {"fire": "true"})
+        if ok:
+            # Log to DB
+            await insert_event(camera_id, object_name, "frame")
+            # Cleanup
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    except Exception as e:
+        print(f"❌ Error in upload_alert_task: {e}")
+
+async def process_frame(img: np.ndarray, camera_id: int, background_tasks: Optional[BackgroundTasks] = None) -> bool:
+    """
+    Processes a single frame: AI segmentation, queueing for recording, and updating feed.
+    S3 uploads are handled as background tasks to prevent blocking.
+    """
+    state = get_camera_state(camera_id)
+    if state["detection_enabled"]:
+        result_img, is_fire = await asyncio.to_thread(segment_image, img)
+    else:
+        result_img, is_fire = img, False
+
+    # 1. Send to video recorder worker (in-memory queue, very fast)
+    await frame_queue.put((img, is_fire, camera_id))
+
+    # 2. Update latest frame for real-time /video_feed stream
+    state = get_camera_state(camera_id)
+    encode_success, jpeg_buffer = await asyncio.to_thread(cv2.imencode, ".jpg", result_img)
+    if encode_success:
+        frame_bytes = jpeg_buffer.tobytes()
+        async with state["lock"]:
+            state["latest_frame"] = frame_bytes
+        state["event"].set()
+        state["event"].clear()
+
+    # 3. Handle fire alerts in the background if detected
+    if is_fire:
+        if background_tasks:
+            background_tasks.add_task(upload_alert_task, result_img, camera_id)
+        else:
+            # Fallback for environments where background_tasks is not available (like raw WS loop)
+            asyncio.create_task(upload_alert_task(result_img, camera_id))
+    
+    return is_fire
+
+@app.websocket("/ws/upload/{camera_id}")
+async def websocket_upload(websocket: WebSocket, camera_id: int):
+    """
+    Handles real-time binary frame uploads via WebSocket.
+    Uses asyncio.create_task for frame processing to avoid blocking the receive loop.
+    """
+    await websocket.accept()
+    print(f"🔌 [Camera {camera_id}] WebSocket connected.")
+    try:
+        while True:
+            # Receive binary frame (this is the only blocking part we want)
+            data = await websocket.receive_bytes()
+            
+            # Offload decoding and processing to not block reception of the next frame
+            asyncio.create_task(handle_websocket_frame(websocket, data, camera_id))
+            
+    except WebSocketDisconnect:
+        print(f"🔌 [Camera {camera_id}] WebSocket disconnected.")
+    except Exception as e:
+        print(f"💥 WebSocket error: {e}")
+
+async def handle_websocket_frame(websocket: WebSocket, data: bytes, camera_id: int):
+    """Decodes and processes a frame received via WebSocket with frame-dropping logic."""
+    state = get_camera_state(camera_id)
+    
+    # --- SERVER-SIDE FRAME DROPPING ---
+    # If we are already processing a frame for this camera, drop the new one 
+    # to maintain real-time performance and prevent a backlog.
+    if state["is_processing"]:
+        return
+
+    try:
+        state["is_processing"] = True
+        
+        nparr = np.frombuffer(data, np.uint8)
+        img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_COLOR)
+        
+        if img is not None:
+            is_fire = await process_frame(img, camera_id)
+            try:
+                await websocket.send_json({"fire_detected": is_fire})
+            except:
+                pass
+    except Exception as e:
+        print(f"❌ Error processing WS frame: {e}")
+    finally:
+        state["is_processing"] = False
+
+@app.get("/toggle_detection/{camera_id}")
+async def toggle_detection(camera_id: int, enabled: Optional[bool] = None):
+    """
+    Toggles fire detection for a specific camera.
+    If 'enabled' query param is not provided, it flips the current state.
+    """
+    state = get_camera_state(camera_id)
+    if enabled is not None:
+        state["detection_enabled"] = enabled
+    else:
+        state["detection_enabled"] = not state["detection_enabled"]
+    
+    status = "ON" if state["detection_enabled"] else "OFF"
+    print(f"⚙️ [Camera {camera_id}] Fire detection switched to: {status}")
+    return {"camera_id": camera_id, "detection_enabled": state["detection_enabled"]}
+
+@app.get("/status/{camera_id}")
+async def get_status(camera_id: int):
+    """Returns the current status of a specific camera."""
+    state = get_camera_state(camera_id)
+    return {
+        "camera_id": camera_id,
+        "detection_enabled": state["detection_enabled"],
+        "is_processing": state["is_processing"]
+    }
+
+@app.get("/events/{camera_id}")
+async def get_events(camera_id: int):
+    """
+    Lists recent fire detection events for a specific camera.
+
+    Args:
+        camera_id (int): The camera ID to query.
+
+    Returns:
+        Dict[str, Any]: Lists of event objects.
+    """
+    rows = await list_events(camera_id)
+    for r in rows:
+        if isinstance(r.get("created_at"), datetime):
+            r["created_at"] = r["created_at"].isoformat()
+    return {"camera_id": camera_id, "events": rows}
+
+@app.get("/video_feed/{camera_id}")
+async def video_feed(camera_id: int):
+    """
+    Provides a real-time MJPEG stream of processed frames from a camera.
+
+    Args:
+        camera_id (int): The camera ID to stream.
+
+    Returns:
+        StreamingResponse: An MJPEG multipart response.
+    """
+    state = get_camera_state(camera_id)
+    
+    async def frame_generator():
+        while True:
+            await state["event"].wait()
+            async with state["lock"]:
+                if state["latest_frame"] is not None:
+                    yield (b"--frame\r\n"
+                           b"Content-Type: image/jpeg\r\n\r\n" + state["latest_frame"] + b"\r\n")
+
+    return StreamingResponse(frame_generator(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

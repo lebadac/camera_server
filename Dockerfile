@@ -1,33 +1,30 @@
-FROM python:3.10
+FROM python:3.10-slim
 
+# Set working directory
 WORKDIR /app
 
-# Copy code & requirements
-COPY fire_segmentation_model.h5 /app/fire_segmentation_model.h5
-COPY server.py /app/server.py
-COPY requirements.txt /app/requirements.txt
-COPY start.sh /app/start.sh
-
-# Cài các thư viện hệ thống cần thiết
+# Install necessary system libraries for OpenCV
 RUN apt-get update && apt-get install -y \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
-    curl \
-    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-# Cài ngrok CLI chính chủ
-RUN curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null && \
-    echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | tee /etc/apt/sources.list.d/ngrok.list && \
-    apt-get update && apt-get install -y ngrok
-
-# Cài Python dependencies
+# Copy requirements first for better caching
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Cấp quyền thực thi cho start.sh
-RUN chmod +x /app/start.sh
+# Copy the rest of the application
+COPY . .
 
-EXPOSE 8888
+# Set environment variables
+ENV PORT=8000
+ENV RECORDER_TEMP_DIR=/app/recorder_temp
 
-# Chạy script khởi động
-CMD ["/app/start.sh"]
+# Create temp directory for recorder
+RUN mkdir -p /app/recorder_temp
+
+# Expose the server port
+EXPOSE $PORT
+
+# Run the application
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]

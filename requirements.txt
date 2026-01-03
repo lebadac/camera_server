@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+opencv-python
+numpy
+tensorflow
+requests
+python-multipart
+supabase
+asyncpg
+boto3
+websockets
+websocket-client
+python-dotenv
