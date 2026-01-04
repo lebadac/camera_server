@@ -36,10 +36,37 @@ async def init_db():
             """
             CREATE TABLE IF NOT EXISTS device_tokens (
                 token TEXT PRIMARY KEY,
+                user_id UUID,
                 created_at TIMESTAMPTZ DEFAULT now()
             );
             """
         )
+        
+        # Migrate user_id column (for existing tables with INTEGER, change to UUID)
+        try:
+            await conn.execute("ALTER TABLE device_tokens ADD COLUMN user_id UUID")
+            print("✅ Database migration: Added user_id column to device_tokens table")
+        except Exception:
+            # Column already exists, try to alter type
+            try:
+                # Drop foreign key first if exists
+                await conn.execute("ALTER TABLE device_tokens DROP CONSTRAINT IF EXISTS device_tokens_user_id_fkey")
+                # Alter column type
+                await conn.execute("ALTER TABLE device_tokens ALTER COLUMN user_id TYPE UUID USING user_id::text::uuid")
+                print("✅ Database migration: Changed user_id column type to UUID")
+            except Exception as e:
+                print(f"⚠️ Migration warning: {e}")
+        
+        # Add foreign key constraint to auth.users if not exists
+        try:
+            await conn.execute("""
+                ALTER TABLE device_tokens 
+                ADD CONSTRAINT device_tokens_user_id_fkey 
+                FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+            """)
+            print("✅ Database migration: Added foreign key constraint to auth.users")
+        except Exception as e:
+            print(f"⚠️ Foreign key constraint not added: {e}")
 
 async def close_db():
     """
@@ -98,28 +125,61 @@ async def list_events(camera_id: int) -> List[Dict[str, Any]]:
         )
         return [dict(r) for r in rows]
 
-async def register_device_token(token: str):
+async def register_device_token(token: str, user_id: str):
     """
-    Registers a new device token for push notifications.
+    Registers a device token for a specific user.
+    
+    Args:
+        token (str): The device registration token from Firebase.
+        user_id (str): The UUID of the user who owns this device (from auth.users.id).
     """
     if _db_pool is None:
         raise RuntimeError("Database pool not initialized")
     
     async with _db_pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO device_tokens(token) VALUES ($1) ON CONFLICT (token) DO NOTHING",
-            token
+            """INSERT INTO device_tokens(token, user_id) 
+               VALUES ($1, $2::uuid) 
+               ON CONFLICT (token) DO UPDATE SET user_id = $2::uuid""",
+            token, user_id
         )
 
-async def get_all_device_tokens() -> List[str]:
+async def delete_device_token(token: str):
     """
-    Retrieves all registered device tokens.
+    Deletes a device token (e.g., when user logs out).
+    
+    Args:
+        token (str): The device registration token to delete.
     """
     if _db_pool is None:
         raise RuntimeError("Database pool not initialized")
     
     async with _db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT token FROM device_tokens")
+        await conn.execute("DELETE FROM device_tokens WHERE token = $1", token)
+
+async def get_tokens_for_camera_owner(camera_id: int) -> List[str]:
+    """
+    Get all device tokens belonging to the owner of the specified camera.
+    
+    Args:
+        camera_id (int): The camera ID to get owner's tokens for.
+        
+    Returns:
+        List[str]: List of device tokens for the camera owner.
+    """
+    if _db_pool is None:
+        raise RuntimeError("Database pool not initialized")
+    
+    async with _db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT dt.token 
+            FROM device_tokens dt
+            JOIN cameras c ON c.owner_id = dt.user_id
+            WHERE c.camera_id = $1 AND dt.user_id IS NOT NULL
+            """,
+            camera_id
+        )
         return [r["token"] for r in rows]
 
 async def get_camera_label(camera_id: int) -> str:

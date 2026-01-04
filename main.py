@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Query, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Query, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 
@@ -15,7 +15,7 @@ from model.segment import segment_image, load_model
 from utils.s3_client import upload_file_to_s3
 from utils.database import (
     init_db, close_db, insert_event, list_events, 
-    register_device_token, get_all_device_tokens
+    register_device_token, delete_device_token, get_tokens_for_camera_owner
 )
 from utils.notifier import init_firebase, send_fire_notification
 from utils.gemini_analyzer import analyze_fire_context
@@ -33,7 +33,7 @@ def get_camera_state(camera_id: int) -> Dict[str, Any]:
             "event": asyncio.Event(),
             "lock": asyncio.Lock(),
             "is_processing": False,
-            "detection_enabled": False  # Default to ON
+            "detection_enabled": True  # Default to ON
         }
     return camera_states[camera_id]
 
@@ -157,7 +157,7 @@ async def process_frame(img: np.ndarray, camera_id: int, background_tasks: Optio
         
         # Trigger Push Notifications with context
         async def notify_all():
-            tokens = await get_all_device_tokens()
+            tokens = await get_tokens_for_camera_owner(camera_id)
             if tokens:
                 await send_fire_notification(tokens, camera_id, fire_context)
         
@@ -257,18 +257,46 @@ async def get_events(camera_id: int):
     return {"camera_id": camera_id, "events": rows}
 
 @app.post("/register_token")
-async def register_token(data: Dict[str, str]):
+async def register_token(data: Dict[str, Any]):
     """
     Registers an Android device token for Firebase Push Notifications.
+    Example body: {"token": "YOUR_DEVICE_REGISTRATION_TOKEN", "user_id": "550e8400-e29b-41d4-a716-446655440000"}
+    
+    Note: user_id must be a valid UUID from auth.users table.
+    """
+    # Debug logging
+    print(f"📥 Register token request received: {data}")
+    
+    token = data.get("token")
+    user_id = data.get("user_id")
+    
+    print(f"🔍 token={token[:20] if token else None}..., user_id={user_id}")
+    
+    if not token or not user_id:
+        print(f"❌ Missing required fields: token={bool(token)}, user_id={bool(user_id)}")
+        raise HTTPException(status_code=400, detail="token and user_id are required")
+    
+    await register_device_token(token, user_id)
+    print(f"📱 Device token registered for User {user_id[:8]}...: {token[:20]}...")
+    return {"status": "success", "message": f"Token registered for user {user_id}"}
+
+@app.post("/unregister_token")
+async def unregister_token(data: Dict[str, Any]):
+    """
+    Unregisters a device token (e.g., on user logout).
     Example body: {"token": "YOUR_DEVICE_REGISTRATION_TOKEN"}
+    
+    This prevents notification leaks when users switch accounts on the same device.
     """
     token = data.get("token")
-    if not token:
-        return {"error": "Token is required"}, 400
     
-    await register_device_token(token)
-    print(f"📱 New device token registered: {token[:20]}...")
-    return {"status": "success", "message": "Token registered"}
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+    
+    await delete_device_token(token)
+    print(f"🚪 Device token unregistered: {token[:20]}...")
+    return {"status": "success", "message": "Token unregistered"}
+
 
 @app.get("/video_feed/{camera_id}")
 async def video_feed(camera_id: int):
