@@ -43,3 +43,9 @@ recorder_temp/
 # OS
 .DS_Store
 Thumbs.db
+
+# Firebase (Sensitive)
+firebase-service-account.json
+
+# Ngrok
+current_ngrok_url.txt

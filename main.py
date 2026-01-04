@@ -18,6 +18,7 @@ from utils.database import (
     register_device_token, get_all_device_tokens
 )
 from utils.notifier import init_firebase, send_fire_notification
+from utils.gemini_analyzer import analyze_fire_context
 from services.video_recorder import video_recorder_worker, frame_queue
 
 # Global state for camera streams
@@ -32,7 +33,7 @@ def get_camera_state(camera_id: int) -> Dict[str, Any]:
             "event": asyncio.Event(),
             "lock": asyncio.Lock(),
             "is_processing": False,
-            "detection_enabled": True  # Default to ON
+            "detection_enabled": False  # Default to ON
         }
     return camera_states[camera_id]
 
@@ -95,6 +96,12 @@ async def upload_alert_task(img: np.ndarray, camera_id: int):
     try:
         # Save locally first
         await asyncio.to_thread(cv2.imwrite, tmp_path, img)
+        
+        # Analyze with Gemini AI for context
+        fire_context = await asyncio.to_thread(analyze_fire_context, tmp_path)
+        if fire_context:
+            print(f"🤖 AI Analysis: {fire_context}")
+        
         # Upload to S3
         ok = await asyncio.to_thread(upload_file_to_s3, tmp_path, object_name, "image/jpeg", {"fire": "true"})
         if ok:
@@ -103,8 +110,12 @@ async def upload_alert_task(img: np.ndarray, camera_id: int):
             # Cleanup
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+            
+            # Return context for notification
+            return fire_context
     except Exception as e:
         print(f"❌ Error in upload_alert_task: {e}")
+        return None
 
 async def process_frame(img: np.ndarray, camera_id: int, background_tasks: Optional[BackgroundTasks] = None) -> bool:
     """
@@ -130,21 +141,25 @@ async def process_frame(img: np.ndarray, camera_id: int, background_tasks: Optio
         state["event"].set()
         state["event"].clear()
 
-     # 3. Handle fire alerts in the background if detected
+    # 3. Handle fire alerts in the background if detected
     if is_fire:
         # Generate timestamp for consistent naming
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
+        # Upload alert and get AI context
+        # TODO: Pass original image (img) for Gemini analysis, not segmented image
+        fire_context = None
         if background_tasks:
-            background_tasks.add_task(upload_alert_task, result_img, camera_id)
+            # In background task mode, we can't easily get return value
+            background_tasks.add_task(upload_alert_task, img, camera_id)
         else:
-            asyncio.create_task(upload_alert_task(result_img, camera_id))
+            fire_context = await upload_alert_task(img, camera_id)
         
-        # Trigger Push Notifications
+        # Trigger Push Notifications with context
         async def notify_all():
             tokens = await get_all_device_tokens()
             if tokens:
-                await send_fire_notification(tokens, camera_id)
+                await send_fire_notification(tokens, camera_id, fire_context)
         
         asyncio.create_task(notify_all())
     
