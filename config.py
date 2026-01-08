@@ -24,6 +24,3 @@ MODEL_INPUT_SHAPE = (288, 288, 3)
 MODEL_WEIGHTS_PATH = 'distilled_student_model_weights.weights.h5'
 FIRE_THRESHOLD = 0.6
 MIN_FIRE_RATIO = 0.003
-
-# Gemini AI Configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")

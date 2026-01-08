@@ -31,14 +31,13 @@ def init_firebase():
     
     return _firebase_app
 
-async def send_fire_notification(tokens: List[str], camera_id: int, context: Optional[str] = None):
+async def send_fire_notification(tokens: List[str], camera_id: int):
     """
     Sends a push notification to multiple devices when fire is detected.
     
     Args:
         tokens (List[str]): List of Android registration tokens.
         camera_id (int): ID of the camera that detected fire.
-        context (Optional[str]): AI-generated context about the fire.
     """
     if not tokens:
         return
@@ -55,10 +54,8 @@ async def send_fire_notification(tokens: List[str], camera_id: int, context: Opt
 
     # Send notification to each token individually
     for token in tokens:
-        # Build notification with context
+        # Build notification
         body_text = f"Fire detected at {camera_label}!"
-        if context:
-            body_text += f"\n{context}"
         
         notification_obj = messaging.Notification(
             title="⚠️ FIRE ALERT!",

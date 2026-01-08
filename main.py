@@ -18,7 +18,6 @@ from utils.database import (
     register_device_token, delete_device_token, get_tokens_for_camera_owner
 )
 from utils.notifier import init_firebase, send_fire_notification
-from utils.gemini_analyzer import analyze_fire_context
 from services.video_recorder import video_recorder_worker, frame_queue
 
 # Global state for camera streams
@@ -102,41 +101,34 @@ async def upload_alert_task(original_img: np.ndarray, segmented_img: np.ndarray,
     tmp_path_segmented = os.path.join(RECORDER_TEMP_DIR, f"alert_segmented_{camera_id}_{timestamp}.jpg")
     
     try:
-        # Save both images locally
-        await asyncio.to_thread(cv2.imwrite, tmp_path_original, original_img)
+        # Save segmented image locally for upload
         await asyncio.to_thread(cv2.imwrite, tmp_path_segmented, segmented_img)
-        
-        # Analyze with Gemini AI using ORIGINAL image (no segmentation overlay)
-        fire_context = await asyncio.to_thread(analyze_fire_context, tmp_path_original)
-        if fire_context:
-            print(f"🤖 AI Analysis: {fire_context}")
         
         # Upload SEGMENTED image to S3 (for user viewing)
         ok = await asyncio.to_thread(upload_file_to_s3, tmp_path_segmented, object_name, "image/jpeg", {"fire": "true"})
         if ok:
             # Log to DB
             await insert_event(camera_id, object_name, "frame")
-            # Cleanup both temp files
-            if os.path.exists(tmp_path_original):
-                os.remove(tmp_path_original)
+            # Cleanup temp file
             if os.path.exists(tmp_path_segmented):
                 os.remove(tmp_path_segmented)
             
-            # Return context for notification
-            return fire_context
+            return True
     except Exception as e:
         print(f"❌ Error in upload_alert_task: {e}")
         # Cleanup on error
-        for path in [tmp_path_original, tmp_path_segmented]:
-            if os.path.exists(path):
-                os.remove(path)
-        return None
+        if os.path.exists(tmp_path_segmented):
+            os.remove(tmp_path_segmented)
+        return False
 
+import time
 async def process_frame(img: np.ndarray, camera_id: int, background_tasks: Optional[BackgroundTasks] = None) -> bool:
     """
     Processes a single frame: AI segmentation, queueing for recording, and updating feed.
     S3 uploads are handled as background tasks to prevent blocking.
     """
+    start_time = time.perf_counter()
+    
     state = get_camera_state(camera_id)
     if state["detection_enabled"]:
         result_img, is_fire = await asyncio.to_thread(segment_image, img)
@@ -147,34 +139,26 @@ async def process_frame(img: np.ndarray, camera_id: int, background_tasks: Optio
     await frame_queue.put((img, is_fire, camera_id))
 
     # 2. Update latest frame for real-time /video_feed stream
-    state = get_camera_state(camera_id)
     encode_success, jpeg_buffer = await asyncio.to_thread(cv2.imencode, ".jpg", result_img)
     if encode_success:
-        frame_bytes = jpeg_buffer.tobytes()
         async with state["lock"]:
-            state["latest_frame"] = frame_bytes
+            state["latest_frame"] = jpeg_buffer.tobytes() # Store bytes directly
         state["event"].set()
         state["event"].clear()
 
     # 3. Handle fire alerts in the background if detected
     if is_fire:
-        # Generate timestamp for consistent naming
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # Upload alert and get AI context
-        # Pass BOTH: original image (img) for Gemini analysis, segmented (result_img) for S3
-        fire_context = None
+        # Upload alert to S3 in background
         if background_tasks:
-            # In background task mode, we can't easily get return value
             background_tasks.add_task(upload_alert_task, img, result_img, camera_id)
         else:
-            fire_context = await upload_alert_task(img, result_img, camera_id)
+            asyncio.create_task(upload_alert_task(img, result_img, camera_id))
         
-        # Trigger Push Notifications with context
+        # Trigger Push Notifications
         async def notify_all():
             tokens = await get_tokens_for_camera_owner(camera_id)
             if tokens:
-                await send_fire_notification(tokens, camera_id, fire_context)
+                await send_fire_notification(tokens, camera_id)
         
         asyncio.create_task(notify_all())
     
@@ -205,49 +189,58 @@ async def handle_websocket_frame(websocket: WebSocket, data: bytes, camera_id: i
     """Decodes and processes a frame received via WebSocket with frame-dropping logic."""
     state = get_camera_state(camera_id)
     
-    # --- SERVER-SIDE FRAME DROPPING ---
-    # If we are already processing a frame for this camera, drop the new one 
-    # to maintain real-time performance and prevent a backlog.
-    if state["is_processing"]:
-        return
-
     try:
-        state["is_processing"] = True
-        
         nparr = np.frombuffer(data, np.uint8)
         img = await asyncio.to_thread(cv2.imdecode, nparr, cv2.IMREAD_COLOR)
         
-        if img is not None:
+        if img is None:
+            return
+
+        # --- NON-BLOCKING STREAM UPDATE ---
+        # If AI is currently busy, we still update the stream with the raw frame
+        # to maintain a smooth 30 FPS experience.
+        if state["is_processing"] or not state["detection_enabled"]:
+            encode_success, jpeg_buffer = await asyncio.to_thread(cv2.imencode, ".jpg", img)
+            if encode_success:
+                async with state["lock"]:
+                    state["latest_frame"] = jpeg_buffer.tobytes()
+                state["event"].set()
+                state["event"].clear()
+            
+            # If AI is busy, we don't start another prediction for this frame
+            if state["is_processing"]:
+                return
+
+        # --- AI PROCESSING ---
+        try:
+            state["is_processing"] = True
             is_fire = await process_frame(img, camera_id)
             try:
                 await websocket.send_json({"fire_detected": is_fire})
             except:
                 pass
+        finally:
+            state["is_processing"] = False
+
     except Exception as e:
         print(f"❌ Error processing WS frame: {e}")
-    finally:
-        state["is_processing"] = False
 
 @app.post("/toggle_detection/{camera_id}")
 @app.get("/toggle_detection/{camera_id}")
 async def toggle_detection(
     camera_id: int, 
-    enabled: Optional[bool] = None,
-    enable: Optional[bool] = None  # Alternative parameter name for backward compatibility
+    enable: Optional[bool] = None
 ):
     """
     Toggles fire detection for a specific camera.
     Supports both GET and POST methods.
-    Accepts 'enabled' or 'enable' query params (enable takes precedence if both provided).
+    Accepts 'enable' query param to set specific state.
     If no param is provided, it flips the current state.
     """
     state = get_camera_state(camera_id)
     
-    # Use 'enable' if provided, otherwise use 'enabled'
-    toggle_value = enable if enable is not None else enabled
-    
-    if toggle_value is not None:
-        state["detection_enabled"] = toggle_value
+    if enable is not None:
+        state["detection_enabled"] = enable
     else:
         state["detection_enabled"] = not state["detection_enabled"]
     
@@ -257,41 +250,16 @@ async def toggle_detection(
 
 @app.post("/toggle_detection")
 @app.get("/toggle_detection")
-async def toggle_detection_legacy(
-    camera_id: Optional[int] = Query(None),
-    enabled: Optional[bool] = None,
+async def toggle_detection_query(
+    camera_id: int = Query(...), 
     enable: Optional[bool] = None
 ):
     """
-    Legacy endpoint for backward compatibility.
-    Accepts camera_id as optional query parameter instead of path parameter.
-    If camera_id is not provided, toggles detection for ALL active cameras.
+    Support for legacy query parameter style: /toggle_detection?camera_id=1
+    Now strictly requires camera_id (no 'toggle all' behavior).
     """
-    # Use 'enable' if provided, otherwise use 'enabled'
-    toggle_value = enable if enable is not None else enabled
-    
-    if camera_id is not None:
-        # Toggle specific camera
-        return await toggle_detection(camera_id, enabled, enable)
-    else:
-        # Toggle ALL cameras
-        results = []
-        if not camera_states:
-            return {"message": "No active cameras", "cameras": []}
-        
-        for cam_id in camera_states.keys():
-            state = get_camera_state(cam_id)
-            
-            if toggle_value is not None:
-                state["detection_enabled"] = toggle_value
-            else:
-                state["detection_enabled"] = not state["detection_enabled"]
-            
-            status = "ON" if state["detection_enabled"] else "OFF"
-            print(f"⚙️ [Camera {cam_id}] Fire detection switched to: {status}")
-            results.append({"camera_id": cam_id, "detection_enabled": state["detection_enabled"]})
-        
-        return {"message": f"Toggled detection for {len(results)} cameras", "cameras": results}
+    return await toggle_detection(camera_id, enable)
+
 
 @app.get("/status/{camera_id}")
 async def get_status(camera_id: int):

@@ -12,4 +12,3 @@ websockets
 websocket-client
 python-dotenv
 firebase-admin
-google-genai
